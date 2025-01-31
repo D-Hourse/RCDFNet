@@ -1,5 +1,5 @@
 # RCDFNet
-**RCDFNet: 4-D Radar and Camera Dual-Level-BEV Fusion for 3D Object Detection**
+**RCDFNet: A 4-D Radar and Camera Dual-Level Fusion Network for 3D Object Detection**
 
 Peifeng Cheng, Hang Yan, and Luping Wang
 
