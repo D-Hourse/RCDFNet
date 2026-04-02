@@ -1,0 +1,13 @@
+name: RCDFNet3
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pip>=23.0
+  - cudatoolkit=11.1
+  - ninja
+  - pip:
+      - -r requirements.txt

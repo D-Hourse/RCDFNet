@@ -1,0 +1,698 @@
+import time
+import os
+
+import cv2
+import torch
+import mmcv
+from mmcv.runner import force_fp32
+from torch.nn import functional as F
+from torch.distributions import Normal
+from torch.cuda.amp.autocast_mode import autocast
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+
+from mmdet.models import DETECTORS
+from rcdfnet.models.custum_detectors import MVXFasterRCNN
+from rcdfnet.core.bbox.transforms import bbox3d2result
+
+from torchvision.utils import save_image
+from mmcv.cnn import ConvModule, xavier_init
+from .. import builder
+
+import torch.nn as nn
+from .BEVCross_modal_attention import Cross_Modal_Fusion, Cross_Modal_Fusion_test, Transformer_cross_attention
+from .other_modules import PointFusion_att
+from .BEV_deformable_fuser import BEVFuser
+from ..module.MCMA import MCAM
+from .ViewTransform import ViewTransformNet, BEVfusion_mask_att_v2, BEVfusion_mask_att_v2_without_geomatt, BEVfusion_mask_att_v2_without_AttConv, BEVfusion_mask_att_v2_without_ALL
+from plot.heatmap import draw_feature_map
+from tools.misc.visualization import *
+
+
+num = 0
+
+
+####----------------------------debug image------------------------------------
+def denormalize(img_tensor):
+    # 定义用于标准化的均值和标准差
+    mean = np.array([123.675, 116.28, 103.53], dtype=np.float32)
+    std = np.array([58.395, 57.12, 57.375], dtype=np.float32)
+
+    # 将 PyTorch tensor 转换为 NumPy 数组
+    img_np = img_tensor.permute(1, 2, 0).numpy()
+
+    # 反标准化
+    img_np = img_np * std + mean
+
+    # 限制像素值在 [0, 255] 范围内
+    img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+
+    return img_np
+
+
+class SE_Block(nn.Module):  ##基于SE融合
+    def __init__(self, c):
+        super().__init__()
+        self.att = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, c, kernel_size=1, stride=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return x * self.att(x)
+
+
+
+
+
+@DETECTORS.register_module()
+class RC_Dual_level_fusion_vod_BMA(MVXFasterRCNN):
+    """Multi-modality BEVFusion using Faster R-CNN."""
+
+    def __init__(self,image_size=None, camera_stream=True, isfusion_img_index=1,
+                 grid_size=(69.12,79.36), grid_res=0.32, voxel_size=None, se=False, imc=256, radc=384,
+                 return_depth=True, return_mask=True, loss_depth_weight=None,
+                 **kwargs):
+        freeze_radar = kwargs.get('freeze_radar', None)
+        kwargs.pop('freeze_radar')
+        bevfusion_mask_attention = kwargs.get('bev_fusion_mask_att', None)
+        kwargs.pop('bev_fusion_mask_att')
+        pts_output_config = kwargs.get('pts_output_channels', None)
+        kwargs.pop('pts_output_channels')
+        point_fusion_config = kwargs.get('point_fusion', None)
+        kwargs.pop('point_fusion')
+        rc_fusion = kwargs.get('bev_cross_fusion', None)
+        kwargs.pop('bev_cross_fusion')
+        ViewTransform_config = kwargs.get('ViewTransform', None)
+        kwargs.pop('ViewTransform')
+        img_bev_encoder_backbone = kwargs.get('img_bev_encoder_backbone', None)
+        kwargs.pop('img_bev_encoder_backbone')
+        img_bev_encoder_neck = kwargs.get('img_bev_encoder_neck', None)
+        kwargs.pop('img_bev_encoder_neck')
+
+        super(RC_Dual_level_fusion_vod_BMA, self).__init__(**kwargs)
+        self.rc_fusion = rc_fusion['type']
+        self.bevfusion_mask_attention = bevfusion_mask_attention
+        self.lift = camera_stream
+        self.se = se
+        self.image_size = image_size
+        self.pillar_size = voxel_size
+        self.depth_channels = ViewTransform_config['depth_channels']
+        self.downsample = ViewTransform_config['downsample_factor']
+        self.d_bound = ViewTransform_config['d_bound']
+        self.bev_h = int(grid_size[0]//grid_res)
+        self.bev_w = int(grid_size[1]//grid_res)
+        self.output_channels = pts_output_config['out_channels']
+        self.isfusion_img_index = isfusion_img_index
+        self.return_depth = return_depth
+        self.return_mask = return_mask
+        self.loss_depth_weight = loss_depth_weight
+        ####------------ viz------------
+        self.figures_path_det3d_train = None
+        self.figures_path_det3d_test = None
+        ####----------- heatmap------------
+        self.figures_path_bevnd_test = None
+
+        ####-----------pts output--------------
+        if pts_output_config is not None:
+            self.pts_pred_context = nn.Sequential(
+                nn.Conv2d(int(pts_output_config['in_channels']),
+                          int(pts_output_config['in_channels']//2),
+                          kernel_size=3,
+                          stride=1,
+                          padding=1,
+                          padding_mode='reflect'),
+                nn.BatchNorm2d(int(pts_output_config['in_channels']//2)),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(int(pts_output_config['in_channels'] // 2),
+                          int(pts_output_config['out_channels']),
+                          kernel_size=1,
+                          stride=1,
+                          padding=0,
+                          ),
+            )
+        else:
+            self.pts_pred_context = None
+
+        ####-----------BEV conv-----------
+        if img_bev_encoder_backbone is not None:
+            self.img_bev_encoder_backbone = builder.build_backbone(img_bev_encoder_backbone)
+        else:
+            self.img_bev_encoder_backbone = None
+        if img_bev_encoder_neck is not None:
+            self.img_bev_encoder_neck = builder.build_neck(img_bev_encoder_neck)
+        else:
+            self.img_bev_encoder_neck = None
+
+        ####-----------LSS分支初始化--------
+        if camera_stream:
+            self.BEVencoder = ViewTransformNet(**ViewTransform_config)
+
+        ####-----------fuser---------------
+        if point_fusion_config is not None:
+            self.point_Fusion = PointFusion_att(**point_fusion_config)
+        else:
+            self.point_Fusion = None
+        if self.rc_fusion == "concat":  ##融合层
+            if se:
+                self.seblock = SE_Block(radc)
+            self.reduc_conv = ConvModule(
+                radc + imc,
+                256,
+                3,
+                padding=1,
+                conv_cfg=None,
+                norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
+                act_cfg=dict(type='ReLU'),
+                inplace=False)
+        elif self.rc_fusion == "cross_attention_old":
+            self.cross_attention = Cross_Modal_Fusion(kernel_size=3, radc=radc, imc=imc, fusion=256)
+        elif self.rc_fusion == "cross_attention":
+            self.cross_attention = Cross_Modal_Fusion_test(kernel_size=3, radc=radc, imc=imc, fusion=256)
+        elif self.rc_fusion == "cross_attention_transformer":
+            self.cross_attention = Transformer_cross_attention(input_dim=80,output_dim=256,num_heads=8,qkv_bias=True,attn_drop=0.,proj_drop=0.,)
+        elif self.rc_fusion == "deformable_attention":
+            self.cross_attention = BEVFuser(bev1_dims=radc, bev2_dims=imc, embed_dims=256,
+                             num_layers=6, num_heads=4, bev_shape=(self.bev_h, self.bev_w))
+        else:
+            self.cross_attention = None
+
+        ####----------BEV mask---------------
+        if self.return_mask:
+            bevfusion_mask_attention.update(bev_size=(self.bev_h, self.bev_w))
+            self.bma_type = bevfusion_mask_attention['name']
+            self.bevfusion_mask_attention = bevfusion_mask_attention
+            if self.bma_type == 'ALL':
+                self.BMA = BEVfusion_mask_att_v2(**self.bevfusion_mask_attention)
+            elif self.bma_type == 'Without_GEOMatt':
+                self.BMA = BEVfusion_mask_att_v2_without_geomatt(**self.bevfusion_mask_attention)
+            elif self.bma_type == 'Without_ConvAtt':
+                self.BMA = BEVfusion_mask_att_v2_without_AttConv(**self.bevfusion_mask_attention)
+            elif self.bma_type == 'Sup':
+                self.BMA = BEVfusion_mask_att_v2_without_ALL(**self.bevfusion_mask_attention)
+            else:
+                self.BMA = BEVfusion_mask_att_v2(**self.bevfusion_mask_attention)
+        else:
+            self.BMA = None
+
+        ####----------model config---------------------
+        self.freeze_img = kwargs.get('freeze_img', False)
+        self.freeze_radar = freeze_radar
+        self.init_weights()
+        self.freeze()
+
+    ####-----------------------数据预处理-----------------------------
+    def prepare_inputs(self, inputs):
+        # split the inputs into each frame
+        B, N, C, H, W = inputs[0].shape
+        imgs, sensor2egos, ego2globals, intrins, post_rots, post_trans, bda = \
+            inputs
+        mlp_input = self.get_mlp_input(sensor2egos, ego2globals, intrins,
+                                                            post_rots, post_trans, bda)
+
+        sensor2egos = sensor2egos.view(B, N, 4, 4)
+        ego2globals = ego2globals.view(B, N, 4, 4)
+
+        # calculate the transformation from sweep sensor to key ego
+        keyego2global = ego2globals[:, 0, ...].unsqueeze(1)
+        global2keyego = torch.inverse(keyego2global.double().to('cpu')).to(keyego2global.device)
+        sensor2keyegos = \
+            global2keyego @ ego2globals.double() @ sensor2egos.double()
+        sensor2keyegos = sensor2keyegos.float()
+
+        return [imgs, sensor2keyegos, ego2globals, intrins,
+                post_rots, post_trans, bda, mlp_input]
+
+    ####-----------------------冻结部分分支---------------------------
+
+    def freeze(self):
+        if self.freeze_img:
+            if self.with_img_backbone:
+                for param in self.img_backbone.parameters():
+                    param.requires_grad = False
+            if self.with_img_neck:
+                for param in self.img_neck.parameters():
+                    param.requires_grad = False
+            # if self.BEVencoder is not None:
+            #     for param in self.BEVencoder.depth_net.parameters():
+            #         param.requires_grad = False
+            # if self.lift:
+            #     for param in self.lift_splat_shot_vis.parameters():
+            #         param.requires_grad = False
+        if self.freeze_radar:
+            if self.with_pts_backbone:
+                for param in self.pts_backbone.parameters():
+                    param.requires_grad = False
+            if self.with_pts_neck:
+                for param in self.pts_neck.parameters():
+                    param.requires_grad = False
+            # if self.with_pts_bbox:
+            #     for param in self.pts_bbox_head.parameters():
+            #         param.requires_grad = False
+
+    ####--------------------mlp input----------------------------------
+    def get_mlp_input(self, rot, tran, intrin, post_rot, post_tran, bda):
+        return None
+
+    ####--------------------BEV conv----------------------------------
+    @force_fp32()
+    def bev_encoder(self, x):
+        x = self.img_bev_encoder_backbone(x)
+        x = self.img_bev_encoder_neck(x)
+        if type(x) in [list, tuple]:
+            x = x[0]
+        return x
+
+    ####-------------------PointFusion---------------------------------
+    def isfusion(self, pts, pillars, pillars_num_points, pillar_coors, pts_feats, img_feats, img_metas, batch_size, return_extra=False):
+        kwargs = {}
+        # create BEV space
+        pts_metas = {}
+        pts_metas['pillars'] = pillars
+        pts_metas['pillars_num_points'] = pillars_num_points
+        pts_metas['pillar_coors'] = pillar_coors
+        pts_metas['pts'] = pts
+        pts_metas['pillar_size'] = self.pillar_size
+
+        post_rots = img_metas['post_rots']
+        post_trans = img_metas['post_trans'].unsqueeze(-1)
+        img_aug_matrix = torch.cat((post_rots, post_trans), dim=-1).squeeze(dim=1)
+        lidar2img = img_metas['lidar2img'].squeeze(dim=1)
+
+        kwargs.update(dict(pts_metas=pts_metas))
+        kwargs.update(dict(img_metas=img_metas))
+        kwargs.update(dict(img_aug_matrix=img_aug_matrix))
+        kwargs.update(dict(lidar2img=lidar2img))
+        kwargs.update(dict(img_shape=self.image_size[1]))
+
+        img_feats_use = (img_feats[self.isfusion_img_index])
+        result = self.point_Fusion(img_feats_use, pts_feats, batch_size, **kwargs)
+        if return_extra:
+            # result is (bev_feats, proj_info) when point_Fusion.return_proj_info=True
+            return result
+        if isinstance(result, tuple):
+            return result[0]
+        return result
+
+    ####-----------------------------pts feat------------------------
+    def extract_pts_feat(self, pts, img_feats, img_metas, return_extra=False):
+        """Extract features of points."""
+        if not self.with_pts_backbone:
+            return None
+        voxels, num_points, coors = self.voxelize(pts)
+        voxel_features = self.pts_voxel_encoder(voxels, num_points, coors, )
+        batch_size = coors[-1, 0].item() + 1  ###这里加了.item()
+        x = self.pts_middle_encoder(voxel_features, coors, batch_size)
+        x = self.pts_backbone(x)
+        if self.with_pts_neck:
+            x = self.pts_neck(x)
+        if return_extra:
+            radar_mid_feats = x[0] if isinstance(x, (list, tuple)) else x
+        if self.point_Fusion:
+            if return_extra:
+                x, proj_info = self.isfusion(pts, voxels, num_points, coors, x, img_feats, img_metas, batch_size, return_extra=True)
+            else:
+                x = self.isfusion(pts, voxels, num_points, coors, x, img_feats, img_metas, batch_size)
+        if self.pts_pred_context:
+            x = self.pts_pred_context(x)
+        if return_extra:
+            return [x], radar_mid_feats, proj_info
+        return [x]
+
+    ####----------------------------fuser feat--------------------------------
+    def extract_feat(self, points, img_inputs, img_metas):
+        """Extract features from images and points."""
+        # output_path = '/plot/Best_RCFusion_fasterRCNN/output_image.png'
+        imgs, sensor2keyegos, ego2globals, intrins, \
+            post_rots, post_trans, bda, _ = self.prepare_inputs(img_inputs)
+        ####------------------------img metas generate-----------------------
+        img_metas_temp = dict()
+        batch_size, _, _, _, _ = imgs.shape
+        calib = []
+        for sample_idx in range(batch_size):
+            mat = img_metas[sample_idx]['lidar2img']
+            mat = torch.Tensor(mat[:3, :]).to(imgs[0].device)
+            calib.append(mat)
+        if batch_size > 1:
+            calib = torch.stack(calib)
+        else:
+            calib = torch.stack(calib).unsqueeze(dim=0)
+        img_metas_temp.update(lidar2img=calib)
+        img_metas_temp.update(sensor2keyegos=sensor2keyegos)
+        img_metas_temp.update(intrins=intrins)
+        img_metas_temp.update(post_rots=post_rots)
+        img_metas_temp.update(post_trans=post_trans)
+        img_metas_temp.update(bda=bda)
+
+
+        img_feats = self.extract_img_feat(imgs, img_metas)  ##图像特征
+        # print(img_feats[0].size(),img_feats[1].size(),img_feats[2].size(),img_feats[3].size(),img_feats[4].size())
+        pts_feats = self.extract_pts_feat(points, img_feats, img_metas_temp)  # 点云特征ortho  ###(B, 384, 124, 108)
+
+
+        # -------------提升的过程写在此处--------------------
+        if self.lift:
+            ###判断batch一致
+            batch_size, _, _, _ = img_feats[0].shape
+            img_bev_feat, depth = self.BEVencoder(img_feats, img_metas_temp)
+            depth = depth.permute(0, 2, 3, 1).contiguous().view(-1, self.depth_channels)
+
+            if pts_feats is None:
+                pts_feats = [img_bev_feat]  ####cam stream only
+            else:
+                # --------融合成为pts_feats----------------
+                if self.rc_fusion == "concat":  # 大小shape不一致，用插值
+                    if img_bev_feat.shape[2:] != pts_feats[0].shape[2:]:
+                        img_bev_feat = F.interpolate(img_bev_feat, pts_feats[0].shape[2:], mode='bilinear',
+                                                     align_corners=True)
+                    fuser_feats = [self.reduc_conv(torch.cat([img_bev_feat, pts_feats[0]], dim=1))]
+                    if self.se:
+                        fuser_feats = [self.seblock(fuser_feats[0])]
+                elif self.rc_fusion == "cross_attention":
+                    # draw_feature_pts_map(pts_feats[0])
+                    if img_bev_feat.shape[2:] != pts_feats[0].shape[2:]:
+                        img_bev_feat = F.interpolate(img_bev_feat, pts_feats[0].shape[2:], mode='bilinear',
+                                                     align_corners=True)
+                    # pts_feats = [self.reduc_radar_conv(pts_feats[0])]
+                    fuser_feats = [self.cross_attention(img_bev_feat, pts_feats[0])]
+                    # draw_feature_fuser_map(pts_feats[0])
+                    # print("draw done")
+                elif self.rc_fusion == "cross_attention_old":
+                    if img_bev_feat.shape[2:] != pts_feats[0].shape[2:]:
+                        img_bev_feat = F.interpolate(img_bev_feat, pts_feats[0].shape[2:], mode='bilinear',
+                                                     align_corners=True)
+                    fuser_feats = [self.cross_attention(img_bev_feat, pts_feats[0])]
+                elif self.rc_fusion == "cross_attention_transformer":
+                    if img_bev_feat.shape[2:] != pts_feats[0].shape[2:]:
+                        img_bev_feat = F.interpolate(img_bev_feat, pts_feats[0].shape[2:], mode='bilinear',
+                                                     align_corners=True)
+                    fuser_feats = [self.cross_attention(img_bev_feat, pts_feats[0])]
+                elif self.rc_fusion == "deformable_attention":
+                    if img_bev_feat.shape[2:] != pts_feats[0].shape[2:]:
+                        img_bev_feat = F.interpolate(img_bev_feat, pts_feats[0].shape[2:], mode='bilinear',
+                                                     align_corners=True)
+                    fuser_feats = [self.cross_attention(img_bev_feat, pts_feats[0])]
+                else:
+                    fuser_feats = pts_feats
+
+            # feature_map_beforeBMA_path = os.path.join('/home/chengpeifeng/Documents/VoD_mmdet3d/plot/before')
+            # draw_feature_map(fuser_feats[0], feature_map_beforeBMA_path)
+            if self.return_mask:
+                mask = torch.zeros((batch_size, self.bev_h, self.bev_w), device=fuser_feats[0].device).to(fuser_feats[0].dtype)
+                fuser_feats, bev_mask_logit = self.BMA(mask, fuser_feats[0])
+                fuser_feats = [fuser_feats]
+            # feature_map_afterBMA_path = os.path.join('/home/chengpeifeng/Documents/VoD_mmdet3d/plot/after')
+            # draw_feature_map(fuser_feats[0], feature_map_afterBMA_path)
+
+            # bev conv
+            if self.img_bev_encoder_backbone:
+                fuser_feats = [self.bev_encoder(fuser_feats[0])]
+
+        return_dict = dict(img_feats=img_feats, pts_feats=fuser_feats, depth_preds=depth)
+        if self.return_mask:
+            return_dict.update(bev_mask=bev_mask_logit)
+
+        return return_dict
+
+    def draw_bev_feature_map(self, bev_feats, img_metas, bev_feats_name='bev_feats_fusion'):
+        # if bev_feats_name == 'bev_feats_fusion_refined': self.vis_time_bevnd += 1
+        # if not self.vis_time_bevnd % self.SAVE_INTERVALS == 0: return
+
+        figures_path_bevnd = self.figures_path_bevnd_test
+
+        b, _, h, w = bev_feats.shape
+        # bev_feats = bev_feats.mean(1).unsqueeze(1) # using mean
+        bev_feats_show = bev_feats.max(1, keepdim=True).values  # using max
+        # bev_feats_show = torch.rot90(bev_feats_show, k=2, dims=(2, 3))\
+        bev_feats_show = torch.flip(bev_feats_show, [2])  # horizontal flip for consistency to gt bev bbox
+        for i in range(bev_feats.shape[0]):
+            img_name = img_metas[i]['pts_filename'].split('/')[-1].split('.')[0]
+            bev_feats_tmp = bev_feats_show[i:i + 1, :, :, :]
+            bev_feats_tmp = (bev_feats_tmp - bev_feats_tmp.min()) / (bev_feats_tmp.max() - bev_feats_tmp.min())
+            # bev_feats_tmp = (bev_feats_tmp - 0.75)/(1.00 - 0.75)
+            if bev_feats_name == 'bev_feats_img': bev_feats_tmp = bev_feats_tmp * 25
+            bev_feats_tmp_np = bev_feats_tmp.squeeze().cpu().detach().numpy()
+            bev_feats_tmp_colored = plt.cm.viridis(bev_feats_tmp_np)[..., :3]
+            bev_feats_tmp_colored = torch.tensor(bev_feats_tmp_colored).permute(2, 0, 1).unsqueeze(0)
+            save_image(bev_feats_tmp_colored, os.path.join(figures_path_bevnd,
+                                                            '_' + img_name + '_'  + '.png'))
+
+    def draw_gt_pred_figures_3d(self, points, imgs, gt_bboxes_3ds, gt_labels_3ds, img_metas, rescale=False,
+                                threshold=0.3, **kwargs):
+        # if training we should decode the bbox from features 'outs_pts' first
+        self.vis_time_box3d += 1
+        if not self.vis_time_box3d % self.SAVE_INTERVALS == 0: return
+        # filter out the ignored labels
+        if self.training:
+            figures_path_det3d = self.figures_path_det3d_train
+        else:
+            figures_path_det3d = self.figures_path_det3d_test
+        gt_bboxes_3ds = [gt_bboxes_3ds[i][gt_labels_3ds[i] != -1] for i in range(len(img_metas))]
+        outs_pts = kwargs['outs_pts']
+        if outs_pts is not None:
+            bbox_list = self.pts_bbox_head.get_bboxes(*outs_pts, img_metas, rescale=False)
+            bbox_list = [bbox3d2result(bboxes, scores, labels) for bboxes, scores, labels in bbox_list]
+        else:
+            bbox_list = None
+
+        # starting visualization
+        for i in range(imgs.shape[0]):  # batch size
+            # preparation
+            input_img = np.array(imgs[i].cpu()).transpose(1, 2, 0)
+            input_img = input_img * self.std[None, None, :] + self.mean[None, None, :]
+            pred_bboxes_3d = bbox_list[i]['boxes_3d'] if bbox_list is not None else None
+            pred_scores_3d = bbox_list[i]['scores_3d'] if bbox_list is not None else None
+            pred_bboxes_3d = pred_bboxes_3d[pred_scores_3d > threshold].to('cpu') if bbox_list is not None else None
+            gt_bboxes_3d = gt_bboxes_3ds[i].to('cpu')
+            proj_mat = img_metas[i]["final_lidar2img"]  # update lidar2img
+            img_name = img_metas[i]['filename'].split('/')[-1].split('.')[0]
+            # project 3D bboxes to image and get show figures
+            if pred_bboxes_3d is not None:
+                if len(pred_bboxes_3d) == 0: pred_bboxes_3d = None
+
+            # draw in image view
+            filename = str(self.vis_time_box3d) + '_' + img_name + '_det3d'
+            result_path = figures_path_det3d
+            mmcv.mkdir_or_exist(result_path)
+            # show_multi_modality_result(img=input_img, gt_bboxes=gt_bboxes_3d, pred_bboxes=pred_bboxes_3d, proj_mat=proj_mat, out_dir=figures_path_det3d, filename=filename, box_mode='lidar', show=False)
+            # draw in bev view
+            save_path = os.path.join(figures_path_det3d, str(self.vis_time_box3d) + '_' + img_name + '_det3d_bev.png')
+            save_path_paper = os.path.join(figures_path_det3d,
+                                           str(self.vis_time_box3d) + '_' + img_name + '_det3d_bev_paper.png')
+            point = points[i].cpu().detach().numpy()[:, :3]
+            pd_bbox_corners = pred_bboxes_3d.corners[:, [0, 2, 4, 6], :2].numpy()[:, (0, 1, 3, 2),
+                              :] if pred_bboxes_3d is not None else None
+            gt_bbox_corners = gt_bboxes_3d.corners[:, [0, 2, 4, 6], :2].numpy()[:, (0, 1, 3, 2),
+                              :] if gt_bboxes_3d is not None else None
+            draw_bev_pts_bboxes(point, gt_bbox_corners, pd_bbox_corners, save_path=save_path, xlim=self.xlim,
+                                ylim=self.ylim)
+            # for paper figures
+            tmp_img_true = custom_draw_lidar_bbox3d_on_img(gt_bboxes_3d, input_img, proj_mat, img_metas,
+                                                           color=(61, 102, 255), thickness=2, scale_factor=3)
+            tmp_img_pred = custom_draw_lidar_bbox3d_on_img(pred_bboxes_3d, input_img, proj_mat, img_metas,
+                                                           color=(241, 101, 72), thickness=2, scale_factor=3)
+            tmp_img_alls = custom_draw_lidar_bbox3d_on_img(pred_bboxes_3d, tmp_img_true, proj_mat, img_metas,
+                                                           color=(241, 101, 72), thickness=2, scale_factor=3)
+            mmcv.imwrite(tmp_img_true, os.path.join(result_path, f'{filename}_gt.png'))
+            mmcv.imwrite(tmp_img_pred, os.path.join(result_path, f'{filename}_pred.png'))
+            mmcv.imwrite(tmp_img_alls, os.path.join(result_path, f'{filename}.png'))
+            draw_paper_bboxes(point, gt_bbox_corners, pd_bbox_corners, save_path=save_path_paper, xlim=self.xlim,
+                              ylim=self.ylim)
+
+    def simple_test(self, points, img_metas, img_inputs=None, rescale=False, gt_bev_mask=None, gt_bboxes_3d=None, gt_labels_3d=None):
+        """Test function without augmentaiton."""
+        feature_dict = self.extract_feat(
+            points, img_inputs=img_inputs, img_metas=img_metas)
+
+        img_feats = feature_dict['img_feats']
+        pts_feats = feature_dict['pts_feats']
+
+        # self.draw_bev_feature_map(pts_feats[0], img_metas)
+        #
+        # # # draw bev features map
+        # img_name = img_metas[0]['pts_filename'].split('/')[-1].split('.')[0]
+        # bev_feature_map = cv2.imread(os.path.join(self.figures_path_bevnd_test, '_' + img_name + '_'  + '.png'))
+        # bev_feature_map = cv2.resize(bev_feature_map, (640, 640))
+        # bev_feature_map = cv2.rotate(bev_feature_map, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        #
+        # global num
+        # cv2.imwrite('/home/chengpeifeng/Documents/VoD_mmdet3d/plot/bev_feature_results/bev' + str(num) + '.jpg', bev_feature_map)
+        #
+        # canvas_temp = gt_bev_mask[0][0].cpu().numpy().copy()
+        # canvas_temp = cv2.flip(canvas_temp, flipCode=0)
+        # canvas_temp = cv2.rotate(canvas_temp, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        # # # 查找Counter
+        # ret, thresh = cv2.threshold(np.uint8(canvas_temp), 0, 255, 0)
+        # contours, hierarchy = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # # # 绘制外接矩形
+        # for contour in contours:
+        #     contour = np.array(contour)
+        #     rect = cv2.minAreaRect(contour)
+        #     box_origin = cv2.boxPoints(rect)
+        #     box_origin = np.int32(box_origin * (640 / 160))
+        #     box_origin = box_origin.reshape((-1, 1, 2))
+        #     cv2.polylines(bev_feature_map, [box_origin], isClosed=True, color=(0, 255, 0), thickness=2)
+
+        # store结果图像
+        # cv2.imwrite(os.path.join(self.figures_path_bevnd_test, '_' + img_name + '_gt'  + '.png'), bev_feature_map)
+        # num = num + 1
+
+        bbox_list = [dict() for i in range(len(img_metas))]
+        if pts_feats and self.with_pts_bbox:
+            bbox_pts = self.simple_test_pts(
+                # pts_feats, img_feats, img_metas, rescale=rescale)
+                pts_feats, img_metas, rescale=rescale)
+            for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
+                result_dict['pts_bbox'] = pts_bbox
+            # viz (disabled in standalone inference path)
+        if img_feats and self.with_img_bbox:
+            bbox_img = self.simple_test_img(
+                img_feats, img_metas, rescale=rescale)
+            for result_dict, img_bbox in zip(bbox_list, bbox_img):
+                result_dict['img_bbox'] = img_bbox
+        return bbox_list
+
+
+    @force_fp32()
+    def get_depth_loss(self, depth_labels, depth_preds):
+        depth_labels = self.get_downsampled_gt_depth(depth_labels)
+        fg_mask = torch.max(depth_labels, dim=1).values > 0.0
+        depth_labels = depth_labels[fg_mask]
+        depth_preds = depth_preds[fg_mask]
+        with autocast(enabled=False):
+            depth_loss = F.binary_cross_entropy(
+                depth_preds,
+                depth_labels,
+                reduction='none',
+            ).sum() / max(1.0, fg_mask.sum())
+        return self.loss_depth_weight * depth_loss
+
+    def get_downsampled_gt_depth(self, gt_depths):
+        """
+        Input:
+            gt_depths: [B, N, H, W]
+        Output:
+            gt_depths: [B*N*h*w, d]
+        """
+        B, N, H, W = gt_depths.shape
+        gt_depths = gt_depths.view(B * N, H // self.downsample,
+                                   self.downsample, W // self.downsample,
+                                   self.downsample, 1)
+        gt_depths = gt_depths.permute(0, 1, 3, 5, 2, 4).contiguous()
+        gt_depths = gt_depths.view(-1, self.downsample * self.downsample)
+        gt_depths_tmp = torch.where(gt_depths == 0.0,
+                                    1e5 * torch.ones_like(gt_depths),
+                                    gt_depths)
+        gt_depths = torch.min(gt_depths_tmp, dim=-1).values
+        gt_depths = gt_depths.view(B * N, H // self.downsample,
+                                   W // self.downsample)
+
+        gt_depths = (gt_depths - (self.d_bound[0] - self.d_bound[2])) / self.d_bound[2]
+
+        gt_depths = torch.where((gt_depths < self.depth_channels) & (gt_depths >= 0.0),
+                                gt_depths, torch.zeros_like(gt_depths))
+        gt_depths = F.one_hot(
+            gt_depths.long(), num_classes=self.depth_channels).view(-1, self.depth_channels)
+        return gt_depths.float()
+
+
+
+    def forward_train(self,
+                      points=None,
+                      img_metas=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None,
+                      gt_labels=None,
+                      gt_bboxes=None,
+                      img_inputs=None,
+                      gt_depth=None,
+                      seg_label=None,
+                      proposals=None,
+                      gt_bboxes_ignore=None,
+                      gt_bev_mask=None):
+
+        feature_dict = self.extract_feat(
+            points, img_inputs=img_inputs, img_metas=img_metas)
+        img_feats = feature_dict['img_feats']
+        pts_feats = feature_dict['pts_feats']
+
+        if self.return_depth:
+            depth_preds = feature_dict['depth_preds']
+
+        losses = dict()
+        if pts_feats:
+            losses_pts = self.forward_pts_train(pts_feats, gt_bboxes_3d,
+                                                gt_labels_3d, img_metas,
+                                                gt_bboxes_ignore)
+            losses.update(losses_pts)
+            if self.return_depth:
+                losses_depth = self.get_depth_loss(gt_depth, depth_preds)
+                losses.update(loss_depth=[losses_depth])
+            if self.return_mask:
+                losses_mask_ce, losses_dice = self.BMA.bev_mask_att.get_bev_mask_loss(gt_bev_mask, feature_dict['bev_mask'])
+                losses.update(losses_mask_ce=[losses_mask_ce])
+                losses.update(losses_dice=[losses_dice])
+
+        if img_feats:
+            losses_img = self.forward_img_train(  ## -------这里没有用到-------
+                img_feats,
+                img_metas=img_metas,
+                gt_bboxes=gt_bboxes,
+                gt_labels=gt_labels,
+                gt_bboxes_ignore=gt_bboxes_ignore,
+                proposals=proposals)
+            losses.update(losses_img)
+        return losses
+
+    def forward_test(self, points, img_metas, img_inputs=None, **kwargs):
+        """
+        Args:
+            points (list[torch.Tensor]): the outer list indicates test-time
+                augmentations and inner torch.Tensor should have a shape NxC,
+                which contains all points in the batch.
+            img_metas (list[list[dict]]): the outer list indicates test-time
+                augs (multiscale, flip, etc.) and the inner list indicates
+                images in a batch
+            img (list[torch.Tensor], optional): the outer
+                list indicates test-time augmentations and inner
+                torch.Tensor should have a shape NxCxHxW, which contains
+                all images in the batch. Defaults to None.
+        """
+        img = img_inputs
+        for var, name in [(points, 'points'), (img_metas, 'img_metas')]:
+            if not isinstance(var, list):
+                raise TypeError('{} must be a list, but got {}'.format(
+                    name, type(var)))
+
+        num_augs = len(points)
+        if num_augs != len(img_metas):
+            raise ValueError(
+                'num of augmentations ({}) != num of image meta ({})'.format(
+                    len(points), len(img_metas)))
+
+        if num_augs == 1:
+            img = [img] if img is None else img
+            return self.simple_test(points[0], img_metas[0], img[0], **kwargs)
+        else:
+            return self.aug_test(points, img_metas, img, **kwargs)
+
+    def depth_loss(self, depth_preds, depth_gt):
+        fg_mask = torch.max(depth_preds, dim=1).values > 0.0
+        # depth_tmp = depth_preds.cpu().detach().numpy()
+        # depth_gt_tmp = depth_gt.cpu().detach().numpy()
+        loss_depth = (F.binary_cross_entropy(depth_preds[fg_mask], depth_gt[fg_mask], reduction='none', ).sum() / max(
+            1.0, fg_mask.sum())) * self.loss_depth_weight
+        return dict(loss_depth=[loss_depth])
+
+
+
+
+
+if __name__ == "__main__":
+    img_bev = torch.randn((2, 256, 124, 108))
+    radar_bev = torch.randn((2, 256, 124, 108))
+    cross_attention = Transformer_cross_attention(dim=256, num_heads=8, qkv_bias=True)
+    out = cross_attention(img_bev, radar_bev)
+    print(out.shape)
