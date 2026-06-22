@@ -124,19 +124,101 @@ PYTHONPATH=. python tools/train.py --help
 
 #### 2.1 Prepare datasets
 
-1) Confirm dataset root paths for VoD and TJ4DRadSet.
+1) Confirm dataset root paths for VoD and TJ4DRadSet. The pkl converter expects
+KITTI-style folders under the dataset root:
 
-2) Generate annotation PKL for VoD:
-
-```bash
-python extract_vod_tj4d_pkl.py vod --root-path <YOUR_DATA_ROOT> --extra-tag <YOUR_TAG>
+```text
+<DATA_ROOT>/
+|-- ImageSets/
+|   |-- train.txt
+|   |-- val.txt
+|   `-- test.txt
+`-- training/
+    |-- image_2/
+    |-- velodyne/
+    |-- calib/
+    `-- label_2/
 ```
 
-3) Generate annotation PKL + dbinfos for TJ4DRadSet:
+`ImageSets/*.txt` should contain one sample id per line, without file suffix.
+Make sure the id width and file suffixes match your local files. The current
+converter reads images as `.png` and point clouds as `.bin`. The released
+configs use `load_dim=7` for VoD and `load_dim=8` for TJ4DRadSet, so adjust the
+converter/config if your point cloud feature dimension is different.
+
+2) Generate annotation PKL for VoD from the project root:
 
 ```bash
-python extract_vod_tj4d_pkl.py TJ4DRadSet_4DRadar --root-path <YOUR_DATA_ROOT> --extra-tag <YOUR_TAG> --out-dir <YOUR_OUTPUT_DIR> --with-gt-db
+PYTHONPATH=. python tools/extract_vod_tj4d_pkl.py vod \
+  --root-path <YOUR_VOD_DATA_ROOT> \
+  --extra-tag vod
 ```
+
+This generates the following files under `<YOUR_VOD_DATA_ROOT>`:
+
+```text
+vod_infos_train.pkl
+vod_infos_val.pkl
+vod_infos_trainval.pkl
+vod_infos_test.pkl
+training/velodyne_reduced/
+```
+
+3) Generate annotation PKL for TJ4DRadSet:
+
+```bash
+PYTHONPATH=. python tools/extract_vod_tj4d_pkl.py TJ4DRadSet_4DRadar \
+  --root-path <YOUR_TJ4D_DATA_ROOT> \
+  --extra-tag TJ4DRadSet_4DRadar \
+  --with-gt-db
+```
+
+This generates the following files under `<YOUR_TJ4D_DATA_ROOT>`:
+
+```text
+TJ4DRadSet_4DRadar_infos_train.pkl
+TJ4DRadSet_4DRadar_infos_val.pkl
+TJ4DRadSet_4DRadar_infos_trainval.pkl
+TJ4DRadSet_4DRadar_infos_test.pkl
+TJ4DRadSet_4DRadar_gt_database/
+TJ4DRadSet_4DRadar_dbinfos_train.pkl
+training/velodyne_reduced/
+```
+
+Note: `--out-dir` is optional. In the current helper script, the info pkl files
+are still written to `--root-path`; using a different `--out-dir` together with
+`--with-gt-db` can make the script fail to find
+`<extra-tag>_infos_train.pkl`. The safest setup is to omit `--out-dir`.
+
+4) Generate depth ground truth used by the RCDFNet pipelines.
+
+Edit `tools/gen_depth_gt.py` first:
+
+- Set `data_root` to your dataset root.
+- Set `INFO_PATHS` to the generated train/val/test pkl files.
+- In `worker_radar`, use the point feature dimension that matches your data
+  (`reshape(-1, 7)` for VoD, `reshape(-1, 8)` for TJ4DRadSet by default).
+
+Then run the script from the project root:
+
+```bash
+PYTHONPATH=.:view_of_delft_dataset_main/vod/frame python tools/gen_depth_gt.py
+```
+
+The script writes generated files to `<DATA_ROOT>/depth_gt_radar/`. The default
+VoD/TJ4D dataset classes read them from `training/depth_gt_radar/`, so move the
+generated directory after the script finishes:
+
+```bash
+mkdir -p <DATA_ROOT>/training
+mv <DATA_ROOT>/depth_gt_radar <DATA_ROOT>/training/depth_gt_radar
+```
+
+RCDFNet does not require VoD image segmentation files for training.
+
+If your local config still contains the legacy `LoadSegsFromFile` step and
+collects `seg_label`, remove those entries or provide the corresponding
+segmentation files.
 
 #### 2.2 Verify dataset paths in config
 
@@ -144,6 +226,15 @@ Please check the following fields in your config files:
 
 - `data_root`
 - `ann_file`
+- point cloud `load_dim` / `use_dim`
+
+For example, update:
+
+- `configs/RCDFNet/RCDFNet_VoD.py`
+- `configs/RCDFNet/RCDFNet_TJ4D.py`
+
+The default configs contain absolute paths from the original training machine;
+replace them with your generated `*_infos_train.pkl` and `*_infos_val.pkl`.
 
 #### 2.3 Prepare pretrained/model checkpoints
 
@@ -206,4 +297,3 @@ We would like to thank the following excellent open-source projects:
 - [RCBEVDet](https://github.com/VDIGPKU/RCBEVDet?tab=readme-ov-file)
 - [FB-BEV](https://github.com/NVlabs/FB-BEV)
 - [CRN](https://github.com/youngskkim/CRN)
-

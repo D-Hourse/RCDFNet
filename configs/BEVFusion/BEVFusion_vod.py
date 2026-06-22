@@ -404,7 +404,6 @@ evaluation = dict(
     ])
 work_dir = './work_dirs/RCDBF_VoD_BMA_cross_attention_transformer'
 resume_from = None
-load_from = '/home/chengpeifeng/Documents/VoD_mmdet3d/checkpoints/mvx_faster_rcnn_detectron2-caffe_20e_coco-pretrain_gt-sample_kitti-3-class_moderate-79.3_20200207-a4a6a3c7.pth'
-# load_img_from = '/home/chengpeifeng/Documents/VoD_mmdet3d/checkpoints/HT_BEVconv_radardepth_ida_epoch_22.pth'
-load_radar_from = '/home/chengpeifeng/Documents/VoD_mmdet3d/tools/work_dirs/vod-Radarpillarnet-11.16/checkpoints/epoch_57.pth'
+load_from = 'checkpoint/Pretrain/mvx_faster_rcnn_detectron2-caffe_20e_coco-pretrain_gt-sample_kitti-3-class_moderate-79.3_20200207-a4a6a3c7.pth'
+load_radar_from = 'checkpoint/Pretrain/RadarPillarNet_vod.pth'
 gpu_ids = range(0, 1)

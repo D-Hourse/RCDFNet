@@ -54,7 +54,7 @@ class Best_RCFusion_FasterRCNN(MVXFasterRCNN):
         self.se = se
 
         ####-----------draw heatmap------------
-        self.figures_path_bevnd_test = '/home/chengpeifeng/Documents/VoD_mmdet3d/plot/heatmap/RCFusion'
+        self.figures_path_bevnd_test = None
         ####-----------LSS分支初始化--------
         if camera_stream:
             self.oft_BEVencoder = OftNet(img_bev_harf=img_bev_harf,grid_size=grid_size, grid_offset=grid_offset, grid_res=grid_res, grid_z_min=grid_z_min, grid_z_max=grid_z_max)
