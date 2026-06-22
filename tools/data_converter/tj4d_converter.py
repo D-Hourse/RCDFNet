@@ -7,7 +7,24 @@ from pathlib import Path
 
 from mmdet3d.core.bbox import box_np_ops
 from .kitti_data_utils import get_kitti_image_info, get_waymo_image_info
-from .nuscenes_converter import post_process_coords
+try:
+    from .nuscenes_converter import post_process_coords
+except ModuleNotFoundError:
+    def post_process_coords(corner_coords, imsize=(1600, 900)):
+        """Return clipped 2D bbox coords from projected 3D corners.
+
+        This fallback keeps the optional 2D annotation export usable when the
+        NuScenes converter helper is not included in the standalone tree.
+        """
+        xs = [coord[0] for coord in corner_coords]
+        ys = [coord[1] for coord in corner_coords]
+        min_x = max(min(xs), 0)
+        min_y = max(min(ys), 0)
+        max_x = min(max(xs), imsize[0])
+        max_y = min(max(ys), imsize[1])
+        if min_x >= max_x or min_y >= max_y:
+            return None
+        return min_x, min_y, max_x, max_y
 
 kitti_categories = ('Pedestrian', 'Cyclist', 'Car','Truck') ###这里有些问题，cat2ID，但是暂时没用到2D文件
 
@@ -95,7 +112,10 @@ def _calculate_num_points_in_gt(data_path,
 def create_kitti_info_file(data_path,
                            pkl_prefix='kitti',
                            save_path=None,
-                           relative_path=True):
+                           relative_path=True,
+                           img_file_tail='.png',
+                           use_prefix_id=True,
+                           num_features=8):
     """Create info file of KITTI dataset.
 
     Given the raw data, generate its related info file in pkl format.
@@ -123,9 +143,11 @@ def create_kitti_info_file(data_path,
         calib=True,
         image_ids=train_img_ids,
         relative_path=relative_path,
-        img_file_tail='.png'
+        img_file_tail=img_file_tail,
+        use_prefix_id=use_prefix_id
         )
-    _calculate_num_points_in_gt(data_path, kitti_infos_train, relative_path)
+    _calculate_num_points_in_gt(
+        data_path, kitti_infos_train, relative_path, num_features=num_features)
     filename = save_path / f'{pkl_prefix}_infos_train.pkl'
     print(f'Kitti info train file is saved to {filename}')
     mmcv.dump(kitti_infos_train, filename)
@@ -136,9 +158,11 @@ def create_kitti_info_file(data_path,
         calib=True,
         image_ids=val_img_ids,
         relative_path=relative_path,
-        img_file_tail='.png'
+        img_file_tail=img_file_tail,
+        use_prefix_id=use_prefix_id
     )
-    _calculate_num_points_in_gt(data_path, kitti_infos_val, relative_path)
+    _calculate_num_points_in_gt(
+        data_path, kitti_infos_val, relative_path, num_features=num_features)
     filename = save_path / f'{pkl_prefix}_infos_val.pkl'
     print(f'Kitti info val file is saved to {filename}')
     mmcv.dump(kitti_infos_val, filename)
@@ -154,7 +178,8 @@ def create_kitti_info_file(data_path,
         calib=True,
         image_ids=test_img_ids,
         relative_path=relative_path,
-        img_file_tail='.png'
+        img_file_tail=img_file_tail,
+        use_prefix_id=use_prefix_id
     )
     filename = save_path / f'{pkl_prefix}_infos_test.pkl'
     print(f'Kitti info test file is saved to {filename}')
@@ -306,7 +331,8 @@ def create_reduced_point_cloud(data_path,
                                val_info_path=None,
                                test_info_path=None,
                                save_path=None,
-                               with_back=False):
+                               with_back=False,
+                               num_features=8):
     """Create reduced point clouds for training/validation/testing.
 
     Args:
@@ -329,18 +355,24 @@ def create_reduced_point_cloud(data_path,
         test_info_path = Path(data_path) / f'{pkl_prefix}_infos_test.pkl'
 
     print('create reduced point cloud for training set')
-    _create_reduced_point_cloud(data_path, train_info_path, save_path)
+    _create_reduced_point_cloud(
+        data_path, train_info_path, save_path, num_features=num_features)
     print('create reduced point cloud for validation set')
-    _create_reduced_point_cloud(data_path, val_info_path, save_path)
+    _create_reduced_point_cloud(
+        data_path, val_info_path, save_path, num_features=num_features)
     print('create reduced point cloud for testing set')
-    _create_reduced_point_cloud(data_path, test_info_path, save_path)
+    _create_reduced_point_cloud(
+        data_path, test_info_path, save_path, num_features=num_features)
     if with_back:
         _create_reduced_point_cloud(
-            data_path, train_info_path, save_path, back=True)
+            data_path, train_info_path, save_path, back=True,
+            num_features=num_features)
         _create_reduced_point_cloud(
-            data_path, val_info_path, save_path, back=True)
+            data_path, val_info_path, save_path, back=True,
+            num_features=num_features)
         _create_reduced_point_cloud(
-            data_path, test_info_path, save_path, back=True)
+            data_path, test_info_path, save_path, back=True,
+            num_features=num_features)
 
 
 def export_2d_annotation(root_path, info_path, mono3d=True):

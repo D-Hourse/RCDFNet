@@ -156,7 +156,8 @@ def get_kitti_image_info(path,
                          num_worker=24,
                          relative_path=True,
                          with_imageshape=True,
-                         img_file_tail='.jpg'):
+                         img_file_tail='.jpg',
+                         use_prefix_id=True):
     """
     KITTI annotation format version 2:
     {
@@ -199,9 +200,9 @@ def get_kitti_image_info(path,
         annotations = None
         if velodyne:
             pc_info['velodyne_path'] = get_velodyne_path(
-                idx, path, training, relative_path, use_prefix_id=True, file_tail='.bin')
+                idx, path, training, relative_path, use_prefix_id=use_prefix_id, file_tail='.bin')
         image_info['image_path'] = get_image_path(idx, path, training,
-                                                  relative_path, use_prefix_id=True, file_tail=img_file_tail)
+                                                  relative_path, use_prefix_id=use_prefix_id, file_tail=img_file_tail)
         if with_imageshape:
             img_path = image_info['image_path']
             if relative_path:
@@ -209,7 +210,7 @@ def get_kitti_image_info(path,
             image_info['image_shape'] = np.array(
                 io.imread(img_path).shape[:2], dtype=np.int32)
         if label_info:
-            label_path = get_label_path(idx, path, training, relative_path, use_prefix_id=True, file_tail='.txt')
+            label_path = get_label_path(idx, path, training, relative_path, use_prefix_id=use_prefix_id, file_tail='.txt')
             if relative_path:
                 label_path = str(root_path / label_path)
             annotations = get_label_anno(label_path)
@@ -228,7 +229,7 @@ def get_kitti_image_info(path,
         ####################################
         if calib:
             calib_path = get_calib_path(
-                idx, path, training, relative_path=False, use_prefix_id=True, file_tail='.txt')
+                idx, path, training, relative_path=False, use_prefix_id=use_prefix_id, file_tail='.txt')
             with open(calib_path, 'r') as f:
                 lines = f.readlines()
             P0 = np.array([float(info) for info in lines[0].split(' ')[1:13]

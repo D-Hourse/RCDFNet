@@ -1,4 +1,5 @@
 import os
+import argparse
 from multiprocessing import Pool
 import cv2
 import matplotlib.pyplot as plt
@@ -7,9 +8,46 @@ import numpy as np
 from nuscenes.utils.data_classes import LidarPointCloud
 from nuscenes.utils.geometry_utils import view_points
 from pyquaternion import Quaternion
-# sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))) .vod.frame
-from transformations import project_pcl_to_image
 import pdb
+
+
+def homogeneous_transformation(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    if transform.shape != (4, 4):
+        raise ValueError(f"{transform.shape} must be 4x4")
+    if points.shape[1] != 4:
+        raise ValueError(f"{points.shape[1]} must be Nx4")
+    return transform.dot(points.T).T
+
+
+def project_3d_to_2d(points: np.ndarray, projection_matrix: np.ndarray):
+    uvw = projection_matrix.dot(points.T)
+    uvw /= uvw[2]
+    return np.round(uvw[:2].T).astype(np.int32)
+
+
+def canvas_crop(points, image_size, points_depth=None):
+    idx = points[:, 0] > 0
+    idx = np.logical_and(idx, points[:, 0] < image_size[1])
+    idx = np.logical_and(idx, points[:, 1] > 0)
+    idx = np.logical_and(idx, points[:, 1] < image_size[0])
+    if points_depth is not None:
+        idx = np.logical_and(idx, points_depth > 0)
+    return idx
+
+
+def project_pcl_to_image(point_cloud, t_camera_pcl, camera_projection_matrix, image_shape):
+    point_homo = np.hstack((point_cloud[:, :3],
+                            np.ones((point_cloud.shape[0], 1),
+                                    dtype=np.float32)))
+    points_camera_frame = homogeneous_transformation(
+        point_homo, transform=t_camera_pcl)
+    point_depth = points_camera_frame[:, 2]
+    uvs = project_3d_to_2d(
+        points=points_camera_frame,
+        projection_matrix=camera_projection_matrix)
+    filtered_idx = canvas_crop(
+        points=uvs, image_size=image_shape, points_depth=point_depth)
+    return uvs[filtered_idx], point_depth[filtered_idx]
 
 # https://github.com/nutonomy/nuscenes-devkit/blob/master/python-sdk/nuscenes/nuscenes.py#L834
 def map_pointcloud_to_image(
@@ -81,24 +119,11 @@ def map_pointcloud_to_image2(
     cv2.destroyAllWindows()
 
 
-####------------------------------VoD----------------------------------------------
-# data_root = '/mnt/data1/chengpeifeng/VoD'
-# INFO_PATHS = ['/mnt/data1/chengpeifeng/VoD/radar_5frames/vod_infos_train.pkl',
-#               '/mnt/data1/chengpeifeng/VoD/radar_5frames/vod_infos_val.pkl',
-#               '/mnt/data1/chengpeifeng/VoD/radar_5frames/vod_infos_test.pkl']
-# #
-# # INFO_PATHS = ['/mnt/data1/chengpeifeng/VoD/lidar/vod_infos_train.pkl',
-# #               '/mnt/data1/chengpeifeng/VoD/lidar/vod_infos_val.pkl',
-# #               '/mnt/data1/chengpeifeng/VoD/lidar/vod_infos_test.pkl']
-#
-# lidar_key = 'LIDAR_TOP'
-
-####-----------------------------TJ4D--------------------------------------------------
-data_root = '/mnt/data1/chengpeifeng/tj4d/datasets/'
-INFO_PATHS = ['/mnt/data1/chengpeifeng/tj4d/datasets/TJ4DRadSet_4DRadar_infos_train.pkl',
-              '/mnt/data1/chengpeifeng/tj4d/datasets/TJ4DRadSet_4DRadar_infos_val.pkl',
-              '/mnt/data1/chengpeifeng/tj4d/datasets/TJ4DRadSet_4DRadar_infos_test.pkl']
-lidar_key = 'LIDAR_TOP'
+data_root = None
+INFO_PATHS = None
+radar_num_features = None
+output_dir = None
+overwrite = False
 
 def worker_lidar(info):
     debug = False
@@ -138,21 +163,11 @@ def worker_lidar(info):
 
 def worker_radar(info):
     debug = False
-    # radar_path = data_root + '/radar_5frames/' + info['point_cloud']['velodyne_path']
-    radar_path = data_root + info['point_cloud']['velodyne_path']
-    ####--------------------vod---------------------------
-    # points = np.fromfile(os.path.join(radar_path),
-    #                      dtype=np.float32,
-    #                      count=-1).reshape(-1, 7)
-    # points = points[:, :4]
-    ####--------------------tj4d---------------------------
+    radar_path = os.path.join(data_root, info['point_cloud']['velodyne_path'])
     points = np.fromfile(os.path.join(radar_path),
                          dtype=np.float32,
-                         count=-1).reshape(-1, 8)
-    a = points[:, :3]
-    b = points[:, 5]
-    b = np.expand_dims(b, axis=1)
-    points = np.concatenate((a, b), axis=1)
+                         count=-1).reshape(-1, radar_num_features)
+    points = points[:, :3]
 
     radar_to_cam_calib = info['calib']['Tr_velo_to_cam']
     cam_intrinsic = info['calib']['P2']
@@ -161,24 +176,57 @@ def worker_radar(info):
     unique_uvs, indices = np.unique(uvs, axis=0, return_index=True)
     unique_point_depth = point_depth[indices]
     image_name = os.path.basename(info['image']['image_path'])
-    if image_name == '100095.png':
-        print("end")
-        debug=True
 
     if debug:
         map_pointcloud_to_image2(info['image'], unique_uvs, unique_point_depth)
 
-    np.concatenate([unique_uvs, unique_point_depth[:, None]], axis=1).astype(np.float32).flatten().tofile(os.path.join(data_root, 'depth_gt_radar', f'{image_name}.bin'))
+    out_path = os.path.join(output_dir, f'{image_name}.bin')
+    if os.path.exists(out_path) and not overwrite:
+        raise FileExistsError(
+            f'{out_path} already exists. Remove it or rerun with --overwrite.')
+    np.concatenate([unique_uvs, unique_point_depth[:, None]], axis=1).astype(np.float32).flatten().tofile(out_path)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Generate radar depth ground truth.')
+    parser.add_argument('--data-root', required=True, help='Dataset root used by the config data_root.')
+    parser.add_argument(
+        '--info-paths',
+        nargs='+',
+        required=True,
+        help='Generated info pkl files, e.g. train/val/test pkl paths.')
+    parser.add_argument(
+        '--num-features',
+        type=int,
+        required=True,
+        help='Radar point feature dimension. Use 7 for VoD and 8 for TJ4DRadSet.')
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=1,
+        help='Number of multiprocessing workers.')
+    parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        help='Overwrite existing files in training/depth_gt_radar.')
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
-    po = Pool(1)
-    mmcv.mkdir_or_exist(os.path.join(data_root, 'depth_gt_radar'))
+    args = parse_args()
+    data_root = args.data_root
+    INFO_PATHS = args.info_paths
+    radar_num_features = args.num_features
+    output_dir = os.path.join(data_root, 'training', 'depth_gt_radar')
+    overwrite = args.overwrite
+    mmcv.mkdir_or_exist(output_dir)
     print("Begin to generate depth_gt, please wait for a moument")
-    for info_path in INFO_PATHS:
-        infos = mmcv.load(info_path)
-        for info in infos:
-            po.apply_async(func=worker_radar, args=(info, ))
-    po.close()
-    po.join()
+    with Pool(args.workers) as po:
+        results = []
+        for info_path in INFO_PATHS:
+            infos = mmcv.load(info_path)
+            for info in infos:
+                results.append(po.apply_async(func=worker_radar, args=(info, )))
+        for result in results:
+            result.get()
     print("Generation finish!!!")

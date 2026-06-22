@@ -141,10 +141,8 @@ KITTI-style folders under the dataset root:
 ```
 
 `ImageSets/*.txt` should contain one sample id per line, without file suffix.
-Make sure the id width and file suffixes match your local files. The current
-converter reads images as `.png` and point clouds as `.bin`. The released
-configs use `load_dim=7` for VoD and `load_dim=8` for TJ4DRadSet, so adjust the
-converter/config if your point cloud feature dimension is different.
+The converter uses 5-digit `.jpg` files with 7-feature radar points for VoD,
+and 6-digit `.png` files with 8-feature radar points for TJ4DRadSet.
 
 2) Generate annotation PKL for VoD from the project root:
 
@@ -169,8 +167,7 @@ training/velodyne_reduced/
 ```bash
 PYTHONPATH=. python tools/extract_vod_tj4d_pkl.py TJ4DRadSet_4DRadar \
   --root-path <YOUR_TJ4D_DATA_ROOT> \
-  --extra-tag TJ4DRadSet_4DRadar \
-  --with-gt-db
+  --extra-tag TJ4DRadSet_4DRadar
 ```
 
 This generates the following files under `<YOUR_TJ4D_DATA_ROOT>`:
@@ -180,39 +177,39 @@ TJ4DRadSet_4DRadar_infos_train.pkl
 TJ4DRadSet_4DRadar_infos_val.pkl
 TJ4DRadSet_4DRadar_infos_trainval.pkl
 TJ4DRadSet_4DRadar_infos_test.pkl
-TJ4DRadSet_4DRadar_gt_database/
-TJ4DRadSet_4DRadar_dbinfos_train.pkl
 training/velodyne_reduced/
 ```
 
-Note: `--out-dir` is optional. In the current helper script, the info pkl files
-are still written to `--root-path`; using a different `--out-dir` together with
-`--with-gt-db` can make the script fail to find
-`<extra-tag>_infos_train.pkl`. The safest setup is to omit `--out-dir`.
-
 4) Generate depth ground truth used by the RCDFNet pipelines.
 
-Edit `tools/gen_depth_gt.py` first:
-
-- Set `data_root` to your dataset root.
-- Set `INFO_PATHS` to the generated train/val/test pkl files.
-- In `worker_radar`, use the point feature dimension that matches your data
-  (`reshape(-1, 7)` for VoD, `reshape(-1, 8)` for TJ4DRadSet by default).
-
-Then run the script from the project root:
+For VoD:
 
 ```bash
-PYTHONPATH=.:view_of_delft_dataset_main/vod/frame python tools/gen_depth_gt.py
+PYTHONPATH=. python tools/gen_depth_gt.py \
+  --data-root <YOUR_VOD_DATA_ROOT> \
+  --info-paths \
+    <YOUR_VOD_DATA_ROOT>/vod_infos_train.pkl \
+    <YOUR_VOD_DATA_ROOT>/vod_infos_val.pkl \
+    <YOUR_VOD_DATA_ROOT>/vod_infos_test.pkl \
+  --num-features 7
 ```
 
-The script writes generated files to `<DATA_ROOT>/depth_gt_radar/`. The default
-VoD/TJ4D dataset classes read them from `training/depth_gt_radar/`, so move the
-generated directory after the script finishes:
+For TJ4DRadSet:
 
 ```bash
-mkdir -p <DATA_ROOT>/training
-mv <DATA_ROOT>/depth_gt_radar <DATA_ROOT>/training/depth_gt_radar
+PYTHONPATH=. python tools/gen_depth_gt.py \
+  --data-root <YOUR_TJ4D_DATA_ROOT> \
+  --info-paths \
+    <YOUR_TJ4D_DATA_ROOT>/TJ4DRadSet_4DRadar_infos_train.pkl \
+    <YOUR_TJ4D_DATA_ROOT>/TJ4DRadSet_4DRadar_infos_val.pkl \
+    <YOUR_TJ4D_DATA_ROOT>/TJ4DRadSet_4DRadar_infos_test.pkl \
+  --num-features 8
 ```
+
+The generated files are saved to `training/depth_gt_radar/` under the dataset
+root. VoD uses names such as `00001.jpg.bin`; TJ4DRadSet uses names such as
+`000001.png.bin`. Existing depth files are not overwritten by default; add
+`--overwrite` if you intentionally want to regenerate them.
 
 RCDFNet does not require VoD image segmentation files for training.
 
